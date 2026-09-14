@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+data/raw/
+data/processed/
+data/sentiment_documents/
+*.parquet
+*.csv
+*.jsonl

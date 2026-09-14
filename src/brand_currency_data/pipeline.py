@@ -73,20 +73,25 @@ def fetch_world_bank(country_code: str, indicator: str, start_year: int, end_yea
 
 def fetch_fx(currency: str, start_date: date, end_date: date) -> pd.DataFrame:
     """Fetch daily target-currency, CHF, and USD rates from Frankfurter/ECB."""
-    if currency.upper() == "CHF":
-        payload = _get_json(f"https://api.frankfurter.app/{start_date}..{end_date}", {"from": "CHF", "to": "USD"})
+    if currency.upper() in {"CHF", "USD"}:
+        base_currency = currency.upper()
+        other_currency = "USD" if base_currency == "CHF" else "CHF"
+        payload = _get_json(
+            f"https://api.frankfurter.app/{start_date}..{end_date}",
+            {"from": base_currency, "to": other_currency},
+        )
         rates = [
             {
                 "date": pd.Timestamp(observation_date),
-                "target_per_chf": 1.0,
-                "target_per_usd": 1 / values["USD"],
-                "chf_per_target": 1.0,
-                "usd_per_target": values["USD"],
+                "target_per_chf": 1.0 if base_currency == "CHF" else 1 / values["CHF"],
+                "target_per_usd": 1 / values["USD"] if base_currency == "CHF" else 1.0,
+                "chf_per_target": 1.0 if base_currency == "CHF" else values["CHF"],
+                "usd_per_target": values["USD"] if base_currency == "CHF" else 1.0,
             }
             for observation_date, values in payload.get("rates", {}).items()
         ]
         if not rates:
-            raise SourceError("Frankfurter returned no FX observations for CHF")
+            raise SourceError(f"Frankfurter returned no FX observations for {base_currency}")
         return pd.DataFrame(
             rates
         ).sort_values("date")

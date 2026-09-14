@@ -9,3 +9,4 @@ data/sentiment_documents/
 *.parquet
 *.csv
 *.jsonl
+!data/sentiment_manifest.example.csv

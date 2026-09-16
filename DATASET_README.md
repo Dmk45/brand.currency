@@ -6,6 +6,7 @@ This project currently produces datasets only. The PyTorch LSTM model will be ad
 
 - Python 3.11 or newer. Python 3.14 is supported by the project code, but confirm that all pinned packages have wheels available in the selected environment.
 - Internet access to the public World Bank API and Frankfurter/ECB API.
+- Internet access to FRED and Yahoo Finance for market features.
 - A CSV manifest containing links to PDF articles and investment reports for sentiment data.
 
 No single public provider supplies genuinely daily values for every requested economic parameter across every country. This implementation therefore uses the broadest suitable source per parameter and creates a daily model-alignment layer. For the USA, interest rate uses FRED's daily effective federal funds rate (`DFF`) and inflation uses FRED's monthly CPI (`CPIAUCSL`). China and Colombia use IMF IFS monthly CPI through DBnomics; when the requested month is not yet available, the latest 12 monthly observations are averaged dynamically and projected across the requested range. The native frequency and whether a value was carried forward are retained in every output row.
@@ -21,7 +22,7 @@ py -m pip install -r requirements.txt
 
 ## Numeric Dataset Usage
 
-Run the collector from the repository root. Use either `--days` with `--as-of`, or an explicit inclusive `--start-date` and `--end-date`. Both date options accept an ISO date or timestamp such as `2026-09-07T00:00:00Z`. Every output file contains one calendar-day row for each date in the requested range.
+Run the collector from the repository root. Use either `--days` with `--as-of`, or an explicit inclusive `--start-date` and `--end-date`. Both date options accept an ISO date or timestamp such as `2026-09-07T00:00:00Z`. Each output uses the provider's native acquisition frequency: daily sources produce daily rows, monthly sources produce monthly rows, quarterly sources produce quarterly rows, and annual sources produce annual rows.
 
 ```powershell
 py -m brand_currency_data.pipeline numeric `
@@ -43,7 +44,7 @@ py -m brand_currency_data numeric `
   --out data/processed
 ```
 
-The range is inclusive. FX providers may return only business days within it; macroeconomic providers return the observations available for the requested calendar years.
+The range is inclusive. FX providers return business-day rows. Lower-frequency providers return only the months, quarters, or years intersecting the requested range; they are not expanded into artificial daily rows.
 
 Because the package lives under `src`, use one of these approaches from the repository root:
 
@@ -69,9 +70,13 @@ interest_rate.csv
 currency_in_circulation.csv
 debt_to_gdp.csv
 currency_conversion.csv
+oil_price.csv
+gold_price.csv
+stock_market_index.csv
+bond_yield.csv
 ```
 
-Every numeric row includes `retrieved_at`, `requested_start`, `requested_end`, `observation_frequency=daily`, `source_frequency`, `source_observation_date`, `is_forward_filled`, `is_projected`, and `data_status`. A source observation is accepted only when its observation date falls inside the requested range. For inflation, a dynamic projection uses the latest 12 monthly observations and records the actual source month in `source_reference_date`; the requested-period anchor is marked `data_status=projected` and `is_projected=True`. Other unavailable values remain empty with `data_status=unavailable_in_requested_range`. `currency_conversion.csv` contains both CHF and USD conversion fields. `target_per_chf` means one CHF expressed in target-currency units.
+Every numeric row includes `retrieved_at`, `requested_start`, `requested_end`, `observation_frequency`, `source_frequency`, `source_observation_date`, `is_forward_filled`, `is_projected`, and `data_status`. A source observation is kept at its native period. For inflation, a dynamic projection uses the latest 12 monthly observations and records the actual source month in `source_reference_date`; the requested-period anchor is marked `data_status=projected` and `is_projected=True`. `currency_conversion.csv` contains both CHF and USD conversion fields. `target_per_chf` means one CHF expressed in target-currency units.
 
 ### Numeric source mapping
 
@@ -84,8 +89,57 @@ Every numeric row includes `retrieved_at`, `requested_start`, `requested_end`, `
 | Currency in circulation | World Bank | `FM.LBL.BMNY.CN`, broad money in local currency as a practical proxy; it is not notes-and-coins-only circulation |
 | Debt growth | IMF WEO via DBnomics | `GGXWDG_NGDP` debt-to-GDP, transformed into percent change over `--debt-years` |
 | Currency conversion | Frankfurter/ECB | Business-day rates converted to target-per-CHF and target-per-USD, aligned to calendar days |
+| Oil price | Yahoo Finance | `CL=F`, WTI crude oil futures price in USD per barrel |
+| Gold price | Yahoo Finance | `GC=F`, gold futures price in USD per troy ounce |
+| Stock market index | Yahoo Finance | Country benchmark ticker; defaults exist for USA, Japan, Great Britain, and China; use `--stock-ticker` for other countries |
+| Bond yield | FRED | Country long-term yield series where mapped; use `--bond-yield-series` for other countries |
 
 The collector records the source in each macro CSV. Check provider definitions and licensing before production use.
+
+Market-feature overrides:
+
+```powershell
+py -m brand_currency_data numeric `
+  --country DEU `
+  --currency EUR `
+  --start-date 2025-01-01T00:00:00Z `
+  --end-date 2025-01-31T23:59:59Z `
+  --stock-ticker ^GDAXI `
+  --bond-yield-series IRLTLT01DEM156N `
+  --out data/processed
+```
+
+The stock ticker must represent the target country's largest or chosen benchmark exchange. The bond series must be documented with its maturity and unit. The program does not guess these for unsupported countries.
+
+## Ordered Country-Pair Dataset
+
+The future model consumes two country datasets with the same feature names. Order matters:
+
+```text
+first country features -> weighting linear layer -> sequence model
+second country features -------------------------> sequence model
+sequence output: second currency per one first currency
+```
+
+For example, with Great Britain first and Russia second, the target is `RUB per GBP`, meaning how many roubles equal one pound. Reversing the countries creates a different training example and target.
+
+Build a pair after collecting both country datasets:
+
+```powershell
+$env:PYTHONPATH = "src"
+py -m brand_currency_data pair `
+  --first-dir data/processed/GBR `
+  --second-dir data/processed/RUS `
+  --first-country GBR `
+  --second-country RUS `
+  --first-currency GBP `
+  --second-currency RUB `
+  --out data/pairs/GBR_RUS
+```
+
+The pair output prefixes feature columns with `first_` and `second_`. `target_exchange_rate.csv` contains `second_currency_per_first_currency`, calculated from both currencies' CHF-referenced rates. Pair rows currently use exact matching observation dates; sequence-window preparation will define any additional alignment policy.
+
+Training batches must sample ordered country pairs without duplicate pairs inside a batch. The reverse order is required as a separate example: `(GBR, RUS)` and `(RUS, GBR)` have different inputs and reciprocal targets. Across epochs, pairs may recur, and the sampler should deliberately include both orientations rather than deduplicating them globally.
 
 ## Sentiment PDF Dataset
 

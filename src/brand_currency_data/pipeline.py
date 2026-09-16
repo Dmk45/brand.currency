@@ -30,6 +30,24 @@ FRED_USA_SERIES = {
     "interest_rate": "DFF",
 }
 
+YAHOO_GLOBAL_MARKET_TICKERS = {
+    "oil_price": "CL=F",
+    "gold_price": "GC=F",
+}
+
+DEFAULT_STOCK_TICKERS = {
+    "USA": "^GSPC",
+    "JPN": "^N225",
+    "GBR": "^FTSE",
+    "CHN": "000001.SS",
+}
+
+DEFAULT_BOND_YIELD_SERIES = {
+    "USA": "DGS10",
+    "JPN": "IRLTLT01JPM156N",
+    "GBR": "IRLTLT01GBM156N",
+}
+
 IMF_WEO_DATASET = "WEO:2024-10"
 
 @dataclass(frozen=True)
@@ -42,6 +60,8 @@ class DatasetConfig:
     as_of: date = date.today()
     requested_start: date | None = None
     requested_end: date | None = None
+    stock_ticker: str | None = None
+    bond_yield_series: str | None = None
 
     def __post_init__(self) -> None:
         if not re.fullmatch(r"[A-Z]{3}", self.country_code):
@@ -232,6 +252,28 @@ def fetch_fx(currency: str, start_date: date, end_date: date) -> pd.DataFrame:
     return pd.DataFrame(rates).sort_values("date")
 
 
+def fetch_yahoo_chart(ticker: str, start_date: date, end_date: date) -> pd.DataFrame:
+    """Fetch daily adjusted close data from Yahoo Finance chart API."""
+    start = int(datetime.combine(start_date, datetime.min.time(), timezone.utc).timestamp())
+    end = int(datetime.combine(end_date + timedelta(days=1), datetime.min.time(), timezone.utc).timestamp())
+    response = requests.get(
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}",
+        params={"period1": start, "period2": end, "interval": "1d", "events": "history"},
+        headers={"User-Agent": "brand-currency-data/0.1"},
+        timeout=60,
+    )
+    response.raise_for_status()
+    result = response.json().get("chart", {}).get("result", [None])[0]
+    if not result:
+        raise SourceError(f"Yahoo Finance returned no data for {ticker}")
+    quotes = result.get("indicators", {}).get("quote", [{}])[0].get("close", [])
+    dates = [pd.Timestamp.utcfromtimestamp(value).tz_localize(None) for value in result.get("timestamp", [])]
+    frame = pd.DataFrame({"date": dates, "value": quotes}).dropna().sort_values("date")
+    if frame.empty:
+        raise SourceError(f"Yahoo Finance returned no usable data for {ticker}")
+    return frame
+
+
 def _write_feature(
     frame: pd.DataFrame,
     path: Path,
@@ -241,6 +283,7 @@ def _write_feature(
     requested_start: date,
     requested_end: date,
     source_frequency: str,
+    observation_frequency: str,
 ) -> None:
     frame = frame.copy()
     frame.insert(0, "feature", feature)
@@ -248,71 +291,63 @@ def _write_feature(
     frame["retrieved_at"] = retrieved_at
     frame["requested_start"] = requested_start.isoformat()
     frame["requested_end"] = requested_end.isoformat()
-    frame["observation_frequency"] = "daily"
+    frame["observation_frequency"] = observation_frequency
     frame["source_frequency"] = source_frequency
     frame.to_csv(path, index=False)
 
 
-def _expand_to_daily(
+def _align_to_native_frequency(
     frame: pd.DataFrame,
     start_date: date,
     end_date: date,
     value_columns: list[str],
+    frequency: str,
 ) -> pd.DataFrame:
-    """Align lower-frequency observations to every calendar date in the range."""
+    """Keep observations at the frequency at which the source publishes them."""
     source = frame.copy()
     source["date"] = pd.to_datetime(source["date"])
-    source = source[
-        (source["date"] >= pd.Timestamp(start_date))
-        & (source["date"] <= pd.Timestamp(end_date))
-    ].sort_values("date")
-    daily = pd.DataFrame({"date": pd.date_range(start_date, end_date, freq="D")})
-    if source.empty:
-        for column in value_columns:
-            daily[column] = pd.NA
-        daily["source_observation_date"] = pd.NaT
-        daily["is_forward_filled"] = False
-        daily["is_projected"] = False
-        daily["data_status"] = "unavailable_in_requested_range"
-        return daily
-    source = source.rename(columns={"date": "source_observation_date"})
-    daily["date"] = pd.to_datetime(daily["date"]).astype("datetime64[ns]")
-    source["source_observation_date"] = pd.to_datetime(source["source_observation_date"]).astype("datetime64[ns]")
-    source_metadata = [column for column in ("is_projected", "source_reference_date") if column in source.columns]
-    daily = pd.merge_asof(
-        daily.sort_values("date"),
-        source[["source_observation_date", *value_columns, *source_metadata]],
-        left_on="date",
-        right_on="source_observation_date",
-        direction="backward",
-    )
-    daily["is_forward_filled"] = daily["source_observation_date"] != daily["date"]
-    if "is_projected" not in daily.columns:
-        daily["is_projected"] = False
-    daily["is_projected"] = daily["is_projected"].fillna(False)
-    daily["data_status"] = daily["is_projected"].map({True: "projected", False: "observed_or_aligned"})
-    daily.loc[daily["source_observation_date"].isna(), "data_status"] = "unavailable_in_requested_range"
-    return daily
+    source["source_observation_date"] = source["date"]
+    if frequency in {"annual", "annual-projection"}:
+        source["period"] = source["date"].dt.to_period("Y")
+        requested = pd.period_range(start_date, end_date, freq="Y")
+        output_dates = [period.start_time for period in requested]
+    elif frequency in {"monthly", "monthly-with-projection", "monthly-projection"}:
+        source["period"] = source["date"].dt.to_period("M")
+        requested = pd.period_range(start_date, end_date, freq="M")
+        output_dates = [period.start_time for period in requested]
+    else:
+        source["period"] = source["date"]
+        requested = pd.date_range(start_date, end_date, freq="D")
+        output_dates = list(requested)
+    source = source[source["period"].isin(requested)].drop_duplicates("period", keep="last")
+    result = source.set_index("period").reindex(requested).reset_index(names="period")
+    result["date"] = output_dates
+    result["source_observation_date"] = result["source_observation_date"]
+    if "is_projected" not in result:
+        result["is_projected"] = False
+    result["is_projected"] = result["is_projected"].fillna(False)
+    result["is_forward_filled"] = result["is_projected"]
+    result["data_status"] = result["is_projected"].map({True: "projected", False: "observed_or_aligned"})
+    result.loc[result["source_observation_date"].isna(), "data_status"] = "unavailable_in_requested_range"
+    return result[["date", "source_observation_date", *value_columns, "is_forward_filled", "is_projected", "data_status", *(["source_reference_date"] if "source_reference_date" in result else [])]]
 
 
-def _project_daily(
+def _project_period(
     frame: pd.DataFrame,
     value_column: str,
     start_date: date,
     end_date: date,
 ) -> pd.DataFrame:
-    """Project the latest verified annual value across the requested daily range."""
+    """Project the latest verified value at the source frequency."""
     latest = frame.sort_values("date").dropna(subset=[value_column]).iloc[-1]
-    daily = pd.DataFrame({"date": pd.date_range(start_date, end_date, freq="D")})
-    daily[value_column] = latest[value_column]
-    daily["source_observation_date"] = pd.Timestamp(start_date)
-    daily["source_reference_date"] = pd.Timestamp(
-        latest.get("source_reference_date", latest["date"])
-    )
-    daily["is_forward_filled"] = True
-    daily["is_projected"] = True
-    daily["data_status"] = "projected"
-    return daily
+    projected = pd.DataFrame({"date": [pd.Timestamp(start_date)]})
+    projected[value_column] = latest[value_column]
+    projected["source_observation_date"] = pd.Timestamp(start_date)
+    projected["source_reference_date"] = pd.Timestamp(latest.get("source_reference_date", latest["date"]))
+    projected["is_forward_filled"] = True
+    projected["is_projected"] = True
+    projected["data_status"] = "projected"
+    return projected
 
 
 def collect_numeric_datasets(config: DatasetConfig) -> list[Path]:
@@ -378,7 +413,7 @@ def collect_numeric_datasets(config: DatasetConfig) -> list[Path]:
             ).any()
         )
         if feature != "inflation" and not has_in_range_observation and not observations.empty:
-            observations = _project_daily(
+            observations = _project_period(
                 observations,
                 value_columns[0],
                 config.collection_start,
@@ -387,7 +422,13 @@ def collect_numeric_datasets(config: DatasetConfig) -> list[Path]:
             source_name = f"{source_name} dynamic projection"
             source_frequency = f"{source_frequency}-projection"
         else:
-            observations = _expand_to_daily(observations, config.collection_start, config.collection_end, value_columns)
+            observations = _align_to_native_frequency(
+                observations,
+                config.collection_start,
+                config.collection_end,
+                value_columns,
+                source_frequency,
+            )
         if (observations["data_status"] == "unavailable_in_requested_range").any():
             unavailable_features.append(feature)
         output = config.output_dir / f"{feature}.csv"
@@ -400,16 +441,15 @@ def collect_numeric_datasets(config: DatasetConfig) -> list[Path]:
             config.collection_start,
             config.collection_end,
             source_frequency,
+            "daily" if source_frequency.startswith(("daily", "business-day")) else source_frequency.split("-")[0],
         )
         written.append(output)
 
     fx = fetch_fx(config.currency, config.collection_start, config.collection_end)
-    fx = _expand_to_daily(
-        fx,
-        config.collection_start,
-        config.collection_end,
-        ["target_per_chf", "target_per_usd", "chf_per_target", "usd_per_target"],
-    )
+    fx["source_observation_date"] = fx["date"]
+    fx["is_forward_filled"] = False
+    fx["is_projected"] = False
+    fx["data_status"] = "observed_or_aligned"
     fx["retrieved_at"] = retrieved_at
     fx["requested_start"] = config.collection_start.isoformat()
     fx["requested_end"] = config.collection_end.isoformat()
@@ -419,6 +459,27 @@ def collect_numeric_datasets(config: DatasetConfig) -> list[Path]:
     fx_output = config.output_dir / "currency_conversion.csv"
     fx.to_csv(fx_output, index=False)
     written.append(fx_output)
+
+    market_sources = [
+        ("oil_price", "Yahoo Finance", YAHOO_GLOBAL_MARKET_TICKERS["oil_price"], "business-day"),
+        ("gold_price", "Yahoo Finance", YAHOO_GLOBAL_MARKET_TICKERS["gold_price"], "business-day"),
+    ]
+    if config.stock_ticker or config.country_code in DEFAULT_STOCK_TICKERS:
+        market_sources.append(("stock_market_index", "Yahoo Finance", config.stock_ticker or DEFAULT_STOCK_TICKERS[config.country_code], "business-day"))
+    if config.bond_yield_series or config.country_code in DEFAULT_BOND_YIELD_SERIES:
+        market_sources.append(("bond_yield", "FRED", config.bond_yield_series or DEFAULT_BOND_YIELD_SERIES[config.country_code], "monthly"))
+    for feature, provider, series_id, frequency in market_sources:
+        if provider == "FRED_GLOBAL_MARKET_SERIES" or provider == "FRED":
+            market = fetch_fred(series_id, config.collection_start, config.collection_end)
+            source = f"FRED:{series_id}"
+        else:
+            market = fetch_yahoo_chart(series_id, config.collection_start, config.collection_end)
+            source = f"Yahoo Finance:{series_id}"
+        market = _align_to_native_frequency(market, config.collection_start, config.collection_end, ["value"], frequency)
+        market = market.rename(columns={"value": feature})
+        output = config.output_dir / f"{feature}.csv"
+        _write_feature(market, output, feature, source, retrieved_at, config.collection_start, config.collection_end, frequency, "daily" if frequency in {"daily", "business-day"} else frequency)
+        written.append(output)
     if unavailable_features:
         raise SourceError(
             "No in-range source data for: "
@@ -466,6 +527,50 @@ def download_sentiment_documents(manifest_path: Path, output_dir: Path) -> list[
     return written
 
 
+def build_country_pair_dataset(
+    first_dir: Path,
+    second_dir: Path,
+    first_country: str,
+    second_country: str,
+    first_currency: str,
+    second_currency: str,
+    output_dir: Path,
+) -> list[Path]:
+    """Combine two country datasets in ordered first/second model-input order."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    feature_files = [
+        path.name
+        for path in first_dir.glob("*.csv")
+        if path.name != "currency_conversion.csv" and (second_dir / path.name).exists()
+    ]
+    written: list[Path] = []
+    for filename in feature_files:
+        first = pd.read_csv(first_dir / filename).add_prefix("first_")
+        second = pd.read_csv(second_dir / filename).add_prefix("second_")
+        joined = pd.merge(first, second, left_on="first_date", right_on="second_date", how="inner")
+        joined.insert(0, "first_country", first_country)
+        joined.insert(1, "second_country", second_country)
+        joined.insert(2, "first_currency", first_currency)
+        joined.insert(3, "second_currency", second_currency)
+        output = output_dir / filename
+        joined.to_csv(output, index=False)
+        written.append(output)
+
+    first_fx = pd.read_csv(first_dir / "currency_conversion.csv")
+    second_fx = pd.read_csv(second_dir / "currency_conversion.csv")
+    first_fx = first_fx[["date", "target_per_chf"]].rename(columns={"target_per_chf": "first_per_chf"})
+    second_fx = second_fx[["date", "target_per_chf"]].rename(columns={"target_per_chf": "second_per_chf"})
+    target = first_fx.merge(second_fx, on="date", how="inner")
+    target["second_currency_per_first_currency"] = target["second_per_chf"] / target["first_per_chf"]
+    target.insert(0, "first_country", first_country)
+    target.insert(1, "second_country", second_country)
+    target.insert(2, "first_currency", first_currency)
+    target.insert(3, "second_currency", second_currency)
+    target.to_csv(output_dir / "target_exchange_rate.csv", index=False)
+    written.append(output_dir / "target_exchange_rate.csv")
+    return written
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Produce Brand Currency feature datasets.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -479,9 +584,19 @@ def build_parser() -> argparse.ArgumentParser:
     numeric.add_argument("--out", type=Path, default=Path("data/processed"))
     numeric.add_argument("--debt-years", type=int, default=5)
     numeric.add_argument("--as-of", type=_parse_timestamp, default=date.today())
+    numeric.add_argument("--stock-ticker", help="Yahoo Finance benchmark ticker for the target country")
+    numeric.add_argument("--bond-yield-series", help="FRED series ID for the target-country bond yield")
     documents = subparsers.add_parser("documents", help="Download PDF sentiment documents from a CSV manifest.")
     documents.add_argument("--manifest", type=Path, required=True)
     documents.add_argument("--out", type=Path, default=Path("data/sentiment_documents"))
+    pair = subparsers.add_parser("pair", help="Combine two country datasets in ordered model-input order.")
+    pair.add_argument("--first-dir", type=Path, required=True)
+    pair.add_argument("--second-dir", type=Path, required=True)
+    pair.add_argument("--first-country", required=True)
+    pair.add_argument("--second-country", required=True)
+    pair.add_argument("--first-currency", required=True)
+    pair.add_argument("--second-currency", required=True)
+    pair.add_argument("--out", type=Path, required=True)
     return parser
 
 
@@ -501,10 +616,22 @@ def main() -> None:
                 args.as_of,
                 args.start_date,
                 args.end_date,
+                args.stock_ticker,
+                args.bond_yield_series,
             )
         )
-    else:
+    elif args.command == "documents":
         files = download_sentiment_documents(args.manifest, args.out)
+    else:
+        files = build_country_pair_dataset(
+            args.first_dir,
+            args.second_dir,
+            args.first_country.upper(),
+            args.second_country.upper(),
+            args.first_currency.upper(),
+            args.second_currency.upper(),
+            args.out,
+        )
     print(f"Wrote {len(files)} files")
     for path in files:
         print(path)

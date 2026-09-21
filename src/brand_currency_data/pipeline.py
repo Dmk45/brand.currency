@@ -614,6 +614,22 @@ def build_country_pair_dataset(
     target.insert(5, "numerator_conversion_set", 1)
     target.to_csv(output_dir / "target_exchange_rate.csv", index=False)
     written.append(output_dir / "target_exchange_rate.csv")
+    validation = target[
+        [
+            "date",
+            "first_country",
+            "second_country",
+            "first_currency",
+            "second_currency",
+            "denominator_conversion_set",
+            "numerator_conversion_set",
+            "second_currency_per_first_currency",
+        ]
+    ].copy()
+    validation = validation.rename(columns={"second_currency_per_first_currency": "observed_exchange_rate"})
+    validation.insert(0, "validation_target", "second_currency_per_first_currency")
+    validation.to_csv(output_dir / "validation_exchange_rate.csv", index=False)
+    written.append(output_dir / "validation_exchange_rate.csv")
     metadata = {
         "first_country": first_country,
         "second_country": second_country,
@@ -625,6 +641,8 @@ def build_country_pair_dataset(
         },
         "target": "second_currency_per_first_currency",
         "target_formula": "second_per_chf / first_per_chf",
+        "validation_file": "validation_exchange_rate.csv",
+        "validation_value": "observed_exchange_rate",
     }
     metadata_path = output_dir / "pair_metadata.json"
     metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")

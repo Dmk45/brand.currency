@@ -137,7 +137,7 @@ py -m brand_currency_data pair `
   --out data/pairs/GBR_RUS
 ```
 
-The pair output prefixes feature columns with `first_` and `second_`. Every paired feature row also contains `first_conversion_set=0` and `second_conversion_set=1`. Set 0 is the denominator/source currency and set 1 is the numerator/target currency. `target_exchange_rate.csv` contains `second_currency_per_first_currency`, calculated from both currencies' CHF-referenced rates, plus the same direction metadata. Dates are normalized to calendar days before joining, so timestamps from the same day align. `pair_metadata.json` records the quote direction for downstream sequence preparation.
+The pair output prefixes feature columns with `first_` and `second_`. Every paired feature row also contains `first_conversion_set=0` and `second_conversion_set=1`. Set 0 is the denominator/source currency and set 1 is the numerator/target currency. `target_exchange_rate.csv` contains `second_currency_per_first_currency`, calculated from both currencies' CHF-referenced rates, plus the same direction metadata. `validation_exchange_rate.csv` is the dedicated validation label list for this ordered currency pair: one observed conversion per matching date, with the same quote direction and conversion-set metadata. It contains no macro input features. Dates are normalized to calendar days before joining, so timestamps from the same day align. `pair_metadata.json` records the quote direction and validation artifact for downstream sequence preparation.
 
 For example, put RUB in `--first-dir` and USD in `--second-dir` to produce USD per RUB. Reversing the directories produces the reciprocal target and a separate ordered training example.
 

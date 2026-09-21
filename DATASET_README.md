@@ -4,14 +4,10 @@ This project currently produces datasets only. The PyTorch LSTM model will be ad
 
 ## Requirements
 
-- Python 3.11 or newer. Python 3.14 is supported by the project code, but confirm that all pinned packages have wheels available in the selected environment.
-- Internet access to the public World Bank API and Frankfurter/ECB API.
-- Internet access to FRED and Yahoo Finance for market features.
-- A CSV manifest containing links to PDF articles and investment reports for sentiment data.
 
-No single public provider supplies genuinely daily values for every requested economic parameter across every country. This implementation therefore uses the broadest suitable source per parameter and creates a daily model-alignment layer. For the USA, interest rate uses FRED's daily effective federal funds rate (`DFF`) and inflation uses FRED's monthly CPI (`CPIAUCSL`). China and Colombia use IMF IFS monthly CPI through DBnomics; when the requested month is not yet available, the latest 12 monthly observations are averaged dynamically and projected across the requested range. The native frequency and whether a value was carried forward are retained in every output row.
+No single public provider supplies genuinely daily values for every requested economic parameter across every country. The collector therefore preserves each source's native cadence: daily and business-day sources retain only their actual observations, while monthly and annual sources produce one row per source period intersecting the requested range. For the USA, interest rate uses FRED's daily effective federal funds rate (`DFF`), inflation uses FRED's monthly CPI (`CPIAUCSL`), and electricity price uses FRED's monthly average residential electricity price (`APU000072610`). The native frequency and whether a value was projected are retained in every output row.
 
-Install with the Windows Python launcher:
+Each numeric input is written to a separate CSV so that feature validation, replacement, and future model assembly remain independent.
 
 ```powershell
 py -m venv .venv
@@ -70,9 +66,11 @@ interest_rate.csv
 currency_in_circulation.csv
 debt_to_gdp.csv
 currency_conversion.csv
+currency_fluctuations.csv
 oil_price.csv
 gold_price.csv
 stock_market_index.csv
+electricity_price.csv
 bond_yield.csv
 ```
 
@@ -88,10 +86,12 @@ Every numeric row includes `retrieved_at`, `requested_start`, `requested_end`, `
 | Interest rate | FRED for USA; World Bank fallback | `DFF`, daily effective federal funds rate for USA; `FR.INR.LEND` annual lending rate otherwise |
 | Currency in circulation | World Bank | `FM.LBL.BMNY.CN`, broad money in local currency as a practical proxy; it is not notes-and-coins-only circulation |
 | Debt growth | IMF WEO via DBnomics | `GGXWDG_NGDP` debt-to-GDP, transformed into percent change over `--debt-years` |
-| Currency conversion | Frankfurter/ECB | Business-day rates converted to target-per-CHF and target-per-USD, aligned to calendar days |
+| Currency conversion | Frankfurter/ECB | Business-day rates converted to target-per-CHF and target-per-USD |
+| Currency fluctuations | Derived from Frankfurter/ECB | Percent change in the average of the target-per-CHF and target-per-USD rates |
 | Oil price | Yahoo Finance | `CL=F`, WTI crude oil futures price in USD per barrel |
 | Gold price | Yahoo Finance | `GC=F`, gold futures price in USD per troy ounce |
 | Stock market index | Yahoo Finance | Country benchmark ticker; defaults exist for USA, Japan, Great Britain, and China; use `--stock-ticker` for other countries |
+| Electricity price | FRED USA | `APU000072610`, average residential electricity price in cents per kWh |
 | Bond yield | FRED | Country long-term yield series where mapped; use `--bond-yield-series` for other countries |
 
 The collector records the source in each macro CSV. Check provider definitions and licensing before production use.
@@ -137,9 +137,13 @@ py -m brand_currency_data pair `
   --out data/pairs/GBR_RUS
 ```
 
-The pair output prefixes feature columns with `first_` and `second_`. `target_exchange_rate.csv` contains `second_currency_per_first_currency`, calculated from both currencies' CHF-referenced rates. Pair rows currently use exact matching observation dates; sequence-window preparation will define any additional alignment policy.
+The pair output prefixes feature columns with `first_` and `second_`. Every paired feature row also contains `first_conversion_set=0` and `second_conversion_set=1`. Set 0 is the denominator/source currency and set 1 is the numerator/target currency. `target_exchange_rate.csv` contains `second_currency_per_first_currency`, calculated from both currencies' CHF-referenced rates, plus the same direction metadata. Dates are normalized to calendar days before joining, so timestamps from the same day align. `pair_metadata.json` records the quote direction for downstream sequence preparation.
 
-Training batches must sample ordered country pairs without duplicate pairs inside a batch. The reverse order is required as a separate example: `(GBR, RUS)` and `(RUS, GBR)` have different inputs and reciprocal targets. Across epochs, pairs may recur, and the sampler should deliberately include both orientations rather than deduplicating them globally.
+For example, put RUB in `--first-dir` and USD in `--second-dir` to produce USD per RUB. Reversing the directories produces the reciprocal target and a separate ordered training example.
+
+The LSTM input should receive both feature sets and their conversion-set labels as ordinary inputs or branch metadata; `conversion_set` should not be treated as hidden long-term memory. For a scalable implementation, use a learned two-value embedding or one-hot indicator alongside each branch, and include country/currency IDs separately when generalization across many currencies is required. Training batches must sample ordered country pairs without duplicate pairs inside a batch. The reverse order is required as a separate example: `(GBR, RUS)` and `(RUS, GBR)` have different inputs and reciprocal targets. Across epochs, pairs may recur, and the sampler should deliberately include both orientations rather than deduplicating them globally.
+
+Use one directional exchange-rate target rather than the arithmetic mean of both conversion rates. The reverse rate is mathematically constrained to be the reciprocal, so averaging the two directions mixes incompatible units. If both orientations are trained, add a reciprocal-consistency loss or evaluate both directions after inversion; do not average rates unless they have first been converted to a common, explicitly defined quantity.
 
 ## Sentiment PDF Dataset
 
@@ -174,6 +178,6 @@ The downloader accepts only files beginning with the PDF signature, stores a SHA
 ## Not Included Yet
 
 - PyTorch or LSTM code
-- Feature joining and sequence-window generation
+- Feature joining and sequence-window generation (the ordered pair export is available, but LSTM window assembly is not)
 - Sentiment scoring by an LLM
 - Model training, evaluation, inference, and Docker orchestration

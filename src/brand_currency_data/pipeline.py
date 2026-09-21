@@ -28,6 +28,7 @@ WORLD_BANK_INDICATORS = {
 FRED_USA_SERIES = {
     "inflation": "CPIAUCSL",
     "interest_rate": "DFF",
+    "electricity_price": "APU000072610",
 }
 
 YAHOO_GLOBAL_MARKET_TICKERS = {
@@ -303,33 +304,34 @@ def _align_to_native_frequency(
     value_columns: list[str],
     frequency: str,
 ) -> pd.DataFrame:
-    """Keep observations at the frequency at which the source publishes them."""
+    """Keep only source observations in range at their native frequency."""
     source = frame.copy()
     source["date"] = pd.to_datetime(source["date"])
     source["source_observation_date"] = source["date"]
     if frequency in {"annual", "annual-projection"}:
         source["period"] = source["date"].dt.to_period("Y")
         requested = pd.period_range(start_date, end_date, freq="Y")
-        output_dates = [period.start_time for period in requested]
     elif frequency in {"monthly", "monthly-with-projection", "monthly-projection"}:
         source["period"] = source["date"].dt.to_period("M")
         requested = pd.period_range(start_date, end_date, freq="M")
-        output_dates = [period.start_time for period in requested]
     else:
-        source["period"] = source["date"]
-        requested = pd.date_range(start_date, end_date, freq="D")
-        output_dates = list(requested)
+        result = source[source["date"].dt.date.between(start_date, end_date)].drop_duplicates("date", keep="last")
+        result = result.drop(columns="period", errors="ignore")
+        if "is_projected" not in result:
+            result["is_projected"] = False
+        result["is_projected"] = result["is_projected"].fillna(False)
+        result["is_forward_filled"] = result["is_projected"]
+        result["data_status"] = result["is_projected"].map({True: "projected", False: "observed_or_aligned"})
+        return result[["date", "source_observation_date", *value_columns, "is_forward_filled", "is_projected", "data_status", *( ["source_reference_date"] if "source_reference_date" in result else [] )]]
     source = source[source["period"].isin(requested)].drop_duplicates("period", keep="last")
-    result = source.set_index("period").reindex(requested).reset_index(names="period")
-    result["date"] = output_dates
-    result["source_observation_date"] = result["source_observation_date"]
+    result = source.drop(columns="period")
+    result["date"] = source["period"].dt.start_time.clip(lower=pd.Timestamp(start_date)).to_numpy()
     if "is_projected" not in result:
         result["is_projected"] = False
     result["is_projected"] = result["is_projected"].fillna(False)
     result["is_forward_filled"] = result["is_projected"]
     result["data_status"] = result["is_projected"].map({True: "projected", False: "observed_or_aligned"})
-    result.loc[result["source_observation_date"].isna(), "data_status"] = "unavailable_in_requested_range"
-    return result[["date", "source_observation_date", *value_columns, "is_forward_filled", "is_projected", "data_status", *(["source_reference_date"] if "source_reference_date" in result else [])]]
+    return result[["date", "source_observation_date", *value_columns, "is_forward_filled", "is_projected", "data_status", *( ["source_reference_date"] if "source_reference_date" in result else [] )]]
 
 
 def _project_period(
@@ -405,13 +407,20 @@ def collect_numeric_datasets(config: DatasetConfig) -> list[Path]:
         else:
             observations = observations.rename(columns={"value": feature})
         value_columns = [f"debt_growth_{config.debt_years}y_percent"] if feature == "debt_to_gdp" else [feature]
-        has_in_range_observation = (
-            not observations.empty
-            and observations["date"].between(
-                pd.Timestamp(config.collection_start),
-                pd.Timestamp(config.collection_end),
-            ).any()
-        )
+        if source_frequency.startswith("annual"):
+            requested_periods = pd.period_range(config.collection_start, config.collection_end, freq="Y")
+            has_in_range_observation = not observations.empty and observations["date"].dt.to_period("Y").isin(requested_periods).any()
+        elif source_frequency.startswith("monthly"):
+            requested_periods = pd.period_range(config.collection_start, config.collection_end, freq="M")
+            has_in_range_observation = not observations.empty and observations["date"].dt.to_period("M").isin(requested_periods).any()
+        else:
+            has_in_range_observation = (
+                not observations.empty
+                and observations["date"].between(
+                    pd.Timestamp(config.collection_start),
+                    pd.Timestamp(config.collection_end),
+                ).any()
+            )
         if feature != "inflation" and not has_in_range_observation and not observations.empty:
             observations = _project_period(
                 observations,
@@ -454,16 +463,40 @@ def collect_numeric_datasets(config: DatasetConfig) -> list[Path]:
     fx["requested_start"] = config.collection_start.isoformat()
     fx["requested_end"] = config.collection_end.isoformat()
     fx["source"] = "Frankfurter/ECB"
-    fx["observation_frequency"] = "daily"
+    fx["observation_frequency"] = "business-day"
     fx["source_frequency"] = "business-day"
     fx_output = config.output_dir / "currency_conversion.csv"
     fx.to_csv(fx_output, index=False)
     written.append(fx_output)
 
+    fluctuations = fx[["date", "target_per_chf", "target_per_usd"]].copy()
+    reference_rate = "target_per_chf" if fluctuations["target_per_chf"].nunique() > 1 else "target_per_usd"
+    fluctuations["currency_fluctuations"] = fluctuations[reference_rate].pct_change(fill_method=None) * 100
+    fluctuations = fluctuations.dropna(subset=["currency_fluctuations"])
+    fluctuations["source_observation_date"] = fluctuations["date"]
+    fluctuations["is_forward_filled"] = False
+    fluctuations["is_projected"] = False
+    fluctuations["data_status"] = "observed_or_aligned"
+    fluctuation_output = config.output_dir / "currency_fluctuations.csv"
+    _write_feature(
+        fluctuations[["date", "source_observation_date", "currency_fluctuations", "is_forward_filled", "is_projected", "data_status"]],
+        fluctuation_output,
+        "currency_fluctuations",
+        "Derived from Frankfurter/ECB currency conversion rates",
+        retrieved_at,
+        config.collection_start,
+        config.collection_end,
+        "business-day",
+        "business-day",
+    )
+    written.append(fluctuation_output)
+
     market_sources = [
         ("oil_price", "Yahoo Finance", YAHOO_GLOBAL_MARKET_TICKERS["oil_price"], "business-day"),
         ("gold_price", "Yahoo Finance", YAHOO_GLOBAL_MARKET_TICKERS["gold_price"], "business-day"),
     ]
+    if config.country_code == "USA":
+        market_sources.append(("electricity_price", "FRED", FRED_USA_SERIES["electricity_price"], "monthly"))
     if config.stock_ticker or config.country_code in DEFAULT_STOCK_TICKERS:
         market_sources.append(("stock_market_index", "Yahoo Finance", config.stock_ticker or DEFAULT_STOCK_TICKERS[config.country_code], "business-day"))
     if config.bond_yield_series or config.country_code in DEFAULT_BOND_YIELD_SERIES:
@@ -478,7 +511,7 @@ def collect_numeric_datasets(config: DatasetConfig) -> list[Path]:
         market = _align_to_native_frequency(market, config.collection_start, config.collection_end, ["value"], frequency)
         market = market.rename(columns={"value": feature})
         output = config.output_dir / f"{feature}.csv"
-        _write_feature(market, output, feature, source, retrieved_at, config.collection_start, config.collection_end, frequency, "daily" if frequency in {"daily", "business-day"} else frequency)
+        _write_feature(market, output, feature, source, retrieved_at, config.collection_start, config.collection_end, frequency, frequency)
         written.append(output)
     if unavailable_features:
         raise SourceError(
@@ -536,7 +569,12 @@ def build_country_pair_dataset(
     second_currency: str,
     output_dir: Path,
 ) -> list[Path]:
-    """Combine two country datasets in ordered first/second model-input order."""
+    """Combine two country datasets in ordered model-input and quote order.
+
+    The first dataset is conversion_set 0 (the denominator currency) and the
+    second dataset is conversion_set 1 (the numerator currency). This makes
+    the target ``second currency per first currency``.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
     feature_files = [
         path.name
@@ -547,11 +585,15 @@ def build_country_pair_dataset(
     for filename in feature_files:
         first = pd.read_csv(first_dir / filename).add_prefix("first_")
         second = pd.read_csv(second_dir / filename).add_prefix("second_")
+        first["first_date"] = pd.to_datetime(first["first_date"], utc=True).dt.tz_localize(None).dt.normalize()
+        second["second_date"] = pd.to_datetime(second["second_date"], utc=True).dt.tz_localize(None).dt.normalize()
         joined = pd.merge(first, second, left_on="first_date", right_on="second_date", how="inner")
         joined.insert(0, "first_country", first_country)
         joined.insert(1, "second_country", second_country)
         joined.insert(2, "first_currency", first_currency)
         joined.insert(3, "second_currency", second_currency)
+        joined.insert(4, "first_conversion_set", 0)
+        joined.insert(5, "second_conversion_set", 1)
         output = output_dir / filename
         joined.to_csv(output, index=False)
         written.append(output)
@@ -560,14 +602,33 @@ def build_country_pair_dataset(
     second_fx = pd.read_csv(second_dir / "currency_conversion.csv")
     first_fx = first_fx[["date", "target_per_chf"]].rename(columns={"target_per_chf": "first_per_chf"})
     second_fx = second_fx[["date", "target_per_chf"]].rename(columns={"target_per_chf": "second_per_chf"})
+    first_fx["date"] = pd.to_datetime(first_fx["date"], utc=True).dt.tz_localize(None).dt.normalize()
+    second_fx["date"] = pd.to_datetime(second_fx["date"], utc=True).dt.tz_localize(None).dt.normalize()
     target = first_fx.merge(second_fx, on="date", how="inner")
     target["second_currency_per_first_currency"] = target["second_per_chf"] / target["first_per_chf"]
     target.insert(0, "first_country", first_country)
     target.insert(1, "second_country", second_country)
     target.insert(2, "first_currency", first_currency)
     target.insert(3, "second_currency", second_currency)
+    target.insert(4, "denominator_conversion_set", 0)
+    target.insert(5, "numerator_conversion_set", 1)
     target.to_csv(output_dir / "target_exchange_rate.csv", index=False)
     written.append(output_dir / "target_exchange_rate.csv")
+    metadata = {
+        "first_country": first_country,
+        "second_country": second_country,
+        "first_currency": first_currency,
+        "second_currency": second_currency,
+        "conversion_set": {
+            "0": "first currency; denominator/source currency",
+            "1": "second currency; numerator/target currency",
+        },
+        "target": "second_currency_per_first_currency",
+        "target_formula": "second_per_chf / first_per_chf",
+    }
+    metadata_path = output_dir / "pair_metadata.json"
+    metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+    written.append(metadata_path)
     return written
 
 

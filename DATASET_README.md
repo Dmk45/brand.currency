@@ -180,4 +180,44 @@ The downloader accepts only files beginning with the PDF signature, stores a SHA
 - PyTorch or LSTM code
 - Feature joining and sequence-window generation (the ordered pair export is available, but LSTM window assembly is not)
 - Sentiment scoring by an LLM
-- Model training, evaluation, inference, and Docker orchestration
+## Train The LSTM
+
+The training entry point consumes an ordered pair directory created by the `pair` command. It uses target exchange-rate dates as the common calendar, aligns each native-frequency feature with the latest value available on that date, creates fixed-length windows, and fits normalization statistics on the training split only.
+
+```powershell
+$env:PYTHONPATH = "src"
+py -m brand_currency_data.pipeline pair `
+  --first-dir data/processed/GBR `
+  --second-dir data/processed/RUS `
+  --first-country GBR `
+  --second-country RUS `
+  --first-currency GBP `
+  --second-currency RUB `
+  --out data/pairs/GBR_RUS
+
+py -m brand_currency_data.training `
+  --pair-dir data/pairs/GBR_RUS `
+  --window 30 `
+  --epochs 30 `
+  --output artifacts/currency_lstm.pt
+```
+
+The checkpoint contains model configuration, feature names, training-only normalization statistics, window length, and loss history. Use `--device cpu` for CPU training or omit it to use CUDA when available. The model has separate linear feature projections for both ordered countries followed by a shared LSTM and regression head.
+
+### Docker
+
+The image runs the same CPU-compatible training CLI and expects the pair data and output directory to be mounted:
+
+```powershell
+docker build -t brand-currency-lstm .
+docker run --rm `
+  -v "${PWD}/data:/app/data:ro" `
+  -v "${PWD}/artifacts:/app/artifacts" `
+  brand-currency-lstm `
+  --pair-dir /app/data/pairs/GBR_RUS `
+  --output /app/artifacts/currency_lstm.pt
+```
+
+The container uses Python 3.12 and installs dependencies from `requirements.txt`.
+
+- Sentiment scoring by an LLM

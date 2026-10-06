@@ -14,7 +14,7 @@ import pandas as pd
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
-
+ 
 from .model import CurrencyLSTM
 
 TARGET = "second_currency_per_first_currency"

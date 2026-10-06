@@ -5,7 +5,9 @@ __pycache__/
 
 data/raw/
 data/processed/
+data/pairs/
 data/sentiment_documents/
+artifacts/
 *.parquet
 *.csv
 *.jsonl

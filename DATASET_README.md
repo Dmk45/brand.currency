@@ -177,9 +177,7 @@ The downloader accepts only files beginning with the PDF signature, stores a SHA
 
 ## Not Included Yet
 
-- PyTorch or LSTM code
-- Feature joining and sequence-window generation (the ordered pair export is available, but LSTM window assembly is not)
-- Sentiment scoring by an LLM
+- Sentiment scoring and text-feature joining
 ## Train The LSTM
 
 The training entry point consumes an ordered pair directory created by the `pair` command. It uses target exchange-rate dates as the common calendar, aligns each native-frequency feature with the latest value available on that date, creates fixed-length windows, and fits normalization statistics on the training split only.
@@ -198,11 +196,11 @@ py -m brand_currency_data.pipeline pair `
 py -m brand_currency_data.training `
   --pair-dir data/pairs/GBR_RUS `
   --window 30 `
-  --epochs 30 `
+  --epochs 500 `
   --output artifacts/currency_lstm.pt
 ```
 
-The checkpoint contains model configuration, feature names, training-only normalization statistics, window length, and loss history. Use `--device cpu` for CPU training or omit it to use CUDA when available. The model has separate linear feature projections for both ordered countries followed by a shared LSTM and regression head.
+The `window` counts target-date observations (normally business days), not calendar days. The default 30 observations are roughly six calendar weeks. Each epoch prints training and validation Smooth L1 loss on the standardized target, validation MAE/RMSE in quote units, and validation directional accuracy. The checkpoint stores the best validation-loss model, its configuration, feature names, training-only input and target normalization statistics, window length, and loss history. A companion `<checkpoint-stem>_validation_predictions.csv` contains the best model's dated validation predictions and actual values after inverse-transforming to the original exchange-rate quote units (for example, JPY per USD). Validation is the latest 20% of target dates by default; its summary also compares MAE/RMSE with a persistence baseline that predicts the previous observed quote. Use `--device cpu` for CPU training or omit it to use CUDA when available. The model has separate linear feature projections for both ordered countries followed by a shared LSTM and regression head.
 
 ### Docker
 
